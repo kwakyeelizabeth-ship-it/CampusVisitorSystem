@@ -11,11 +11,15 @@ import java.io.Reader;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -28,9 +32,8 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.Executors;
-import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
-import java.util.zip.ZipOutputStream;
+import java.util.zip.ZipEntry;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.DocumentBuilderFactory;
 import org.xml.sax.SAXException;
@@ -56,6 +59,9 @@ public class VisitorSystem {
     private static final Properties LOCAL_SETTINGS = loadLocalSettings();
     private static final String ADMIN_USER = setting("VISITOR_ADMIN_USER", "admin");
     private static final String ADMIN_PASSWORD = setting("VISITOR_ADMIN_PASSWORD", null);
+    private static final String DB_URL = setting("DB_URL", "jdbc:postgresql://localhost:5432/visitor_system");
+    private static final String DB_USER = setting("DB_USER", "visitor");
+    private static final String DB_PASSWORD = setting("DB_PASSWORD", "visitor");
     private static final DateTimeFormatter TIMESTAMP = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
     private static final double CAMPUS_LATITUDE = 5.9204706;
     private static final double CAMPUS_LONGITUDE = 0.0313081;
@@ -86,10 +92,7 @@ public class VisitorSystem {
             throw new IllegalStateException(
                     "Configure VISITOR_ADMIN_PASSWORD in admin.properties or the environment before starting.");
         }
-        Files.createDirectories(DATA_FILE.getParent());
-        if (!Files.exists(DATA_FILE)) {
-            writeVisitors(List.of());
-        }
+        initializeDatabase();
 
         int port = Integer.parseInt(setting("PORT", "8080"));
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
@@ -159,23 +162,13 @@ public class VisitorSystem {
             }
 
             synchronized (VisitorSystem.class) {
-                List<Visitor> visitors = readVisitors();
                 String id;
-                boolean duplicate;
                 do {
                     id = "VIS-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
-                    duplicate = false;
-                    for (Visitor existing : visitors) {
-                        if (existing.id().equals(id)) {
-                            duplicate = true;
-                            break;
-                        }
-                    }
-                } while (duplicate);
+                } while (readVisitor(id) != null);
                 Visitor visitor = new Visitor(id, name, contact, purpose, email, residence,
                         OffsetDateTime.now(ZoneOffset.UTC).format(TIMESTAMP), "", "", "");
-                visitors.add(0, visitor);
-                writeVisitors(visitors);
+                insertVisitor(visitor);
                 String trackingToken = "true".equals(form.get("shareLocation"))
                         ? UUID.randomUUID().toString() + UUID.randomUUID()
                         : "";
@@ -212,22 +205,18 @@ public class VisitorSystem {
                 return;
             }
             synchronized (VisitorSystem.class) {
-                List<Visitor> visitors = readVisitors();
-                for (int i = 0; i < visitors.size(); i++) {
-                    Visitor visitor = visitors.get(i);
-                    if (visitor.id().equalsIgnoreCase(id)) {
-                        if (!visitor.checkedOut().isEmpty()) {
-                            sendError(exchange, 409, "This visitor has already checked out.");
-                            return;
-                        }
-                        Visitor updated = visitor.checkedOutAt(OffsetDateTime.now(ZoneOffset.UTC).format(TIMESTAMP));
-                        visitors.set(i, updated);
-                        writeVisitors(visitors);
-                        LOCATION_TOKENS.remove(visitor.id());
-                        LIVE_LOCATIONS.remove(visitor.id());
-                        sendJson(exchange, 200, visitorJson(updated));
+                Visitor visitor = readVisitor(id);
+                if (visitor != null) {
+                    if (!visitor.checkedOut().isEmpty()) {
+                        sendError(exchange, 409, "This visitor has already checked out.");
                         return;
                     }
+                    Visitor updated = visitor.checkedOutAt(OffsetDateTime.now(ZoneOffset.UTC).format(TIMESTAMP));
+                    updateCheckOut(updated);
+                    LOCATION_TOKENS.remove(visitor.id());
+                    LIVE_LOCATIONS.remove(visitor.id());
+                    sendJson(exchange, 200, visitorJson(updated));
+                    return;
                 }
             }
             sendError(exchange, 404, "No active visit was found for that Visitor ID.");
@@ -366,18 +355,15 @@ public class VisitorSystem {
                 return;
             }
             synchronized (VisitorSystem.class) {
-                List<Visitor> visitors = readVisitors();
-                for (int i = 0; i < visitors.size(); i++) {
-                    Visitor visitor = visitors.get(i);
-                    if (!visitor.id().equalsIgnoreCase(visitorId)) continue;
+                Visitor visitor = readVisitor(visitorId);
+                if (visitor != null) {
                     if (!visitor.checkedOut().isEmpty()) {
                         sendError(exchange, 409, "This visitor has already checked out.");
                         return;
                     }
                     Visitor verified = visitor.verifiedBy(ADMIN_USER,
                             OffsetDateTime.now(ZoneOffset.UTC).format(TIMESTAMP));
-                    visitors.set(i, verified);
-                    writeVisitors(visitors);
+                    updateVerification(verified);
                     sendJson(exchange, 200, visitorJson(verified));
                     return;
                 }
@@ -505,7 +491,71 @@ public class VisitorSystem {
     }
 
     private static List<Visitor> readVisitors() throws IOException {
-        if (!Files.exists(DATA_FILE)) return new ArrayList<>();
+        List<Visitor> visitors = new ArrayList<>();
+        try (Connection connection = openDatabase();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT visitor_id, name, contact, purpose, email, residence, checked_in, checked_out, verified_by, verified_at "
+                             + "FROM visitors ORDER BY checked_in DESC");
+             ResultSet result = statement.executeQuery()) {
+            while (result.next()) visitors.add(visitorFromResult(result));
+            return visitors;
+        } catch (SQLException ex) {
+            throw new IOException("The visitor records could not be read from PostgreSQL.", ex);
+        }
+    }
+
+    private static Visitor readVisitor(String id) throws IOException {
+        try (Connection connection = openDatabase();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT visitor_id, name, contact, purpose, email, residence, checked_in, checked_out, verified_by, verified_at "
+                             + "FROM visitors WHERE LOWER(visitor_id) = LOWER(?)")) {
+            statement.setString(1, id);
+            try (ResultSet result = statement.executeQuery()) {
+                return result.next() ? visitorFromResult(result) : null;
+            }
+        } catch (SQLException ex) {
+            throw new IOException("The visitor record could not be read from PostgreSQL.", ex);
+        }
+    }
+
+    private static Visitor visitorFromResult(ResultSet result) throws SQLException {
+        return new Visitor(
+                result.getString("visitor_id"), result.getString("name"), result.getString("contact"),
+                result.getString("purpose"), result.getString("email"), result.getString("residence"),
+                result.getString("checked_in"), result.getString("checked_out"),
+                result.getString("verified_by"), result.getString("verified_at"));
+    }
+
+    private static Connection openDatabase() throws SQLException {
+        return DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD);
+    }
+
+    private static void initializeDatabase() throws IOException {
+        String schema = """
+                CREATE TABLE IF NOT EXISTS visitors (
+                    visitor_id VARCHAR(40) PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL,
+                    contact VARCHAR(40) NOT NULL,
+                    purpose VARCHAR(200) NOT NULL,
+                    email VARCHAR(254) NOT NULL,
+                    residence VARCHAR(200) NOT NULL,
+                    checked_in TEXT NOT NULL,
+                    checked_out TEXT NOT NULL DEFAULT '',
+                    verified_by VARCHAR(100) NOT NULL DEFAULT '',
+                    verified_at TEXT NOT NULL DEFAULT ''
+                )
+                """;
+        try (Connection connection = openDatabase();
+             Statement statement = connection.createStatement()) {
+            statement.execute(schema);
+        } catch (SQLException ex) {
+            throw new IOException("PostgreSQL could not be reached or initialized.", ex);
+        }
+        migrateExcelRecords();
+    }
+
+    private static void migrateExcelRecords() throws IOException {
+        if (!Files.exists(DATA_FILE)) return;
         try (ZipFile workbook = new ZipFile(DATA_FILE.toFile())) {
             ZipEntry sheet = workbook.getEntry("xl/worksheets/sheet1.xml");
             if (sheet == null) throw new IOException("The visitor workbook is missing its first worksheet.");
@@ -519,91 +569,96 @@ public class VisitorSystem {
             factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
             factory.setXIncludeAware(false);
             factory.setExpandEntityReferences(false);
-            try (InputStream sheetContents = workbook.getInputStream(sheet)) {
+            try (InputStream sheetContents = workbook.getInputStream(sheet);
+                 Connection connection = openDatabase()) {
                 NodeList rows = factory.newDocumentBuilder().parse(sheetContents)
                         .getElementsByTagNameNS("*", "row");
-                List<Visitor> visitors = new ArrayList<>();
-                for (int i = 1; i < rows.getLength(); i++) {
-                    NodeList cells = ((Element) rows.item(i)).getElementsByTagNameNS("*", "c");
-                    if (cells.getLength() < 8) continue;
-                    List<String> values = new ArrayList<>(CSV_HEADER.size());
-                    for (int cell = 0; cell < CSV_HEADER.size(); cell++) {
-                        if (cell >= cells.getLength()) {
-                            values.add("");
-                            continue;
+                String insert = """
+                        INSERT INTO visitors (
+                            visitor_id, name, contact, purpose, email, residence,
+                            checked_in, checked_out, verified_by, verified_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (visitor_id) DO NOTHING
+                        """;
+                try (PreparedStatement statement = connection.prepareStatement(insert)) {
+                    for (int i = 1; i < rows.getLength(); i++) {
+                        NodeList cells = ((Element) rows.item(i)).getElementsByTagNameNS("*", "c");
+                        if (cells.getLength() < 8) continue;
+                        List<String> values = new ArrayList<>(CSV_HEADER.size());
+                        for (int cell = 0; cell < CSV_HEADER.size(); cell++) {
+                            if (cell >= cells.getLength()) {
+                                values.add("");
+                                continue;
+                            }
+                            NodeList text = ((Element) cells.item(cell)).getElementsByTagNameNS("*", "t");
+                            values.add(text.getLength() == 0 ? "" : text.item(0).getTextContent());
                         }
-                        NodeList text = ((Element) cells.item(cell)).getElementsByTagNameNS("*", "t");
-                        values.add(text.getLength() == 0 ? "" : text.item(0).getTextContent());
+                        Visitor visitor = new Visitor(values.get(0), values.get(1), values.get(2),
+                                values.get(3), values.get(4), values.get(5), values.get(6),
+                                values.get(7), values.get(8), values.get(9));
+                        setVisitor(statement, visitor);
+                        statement.addBatch();
                     }
-                    visitors.add(new Visitor(values.get(0), values.get(1), values.get(2), values.get(3),
-                            values.get(4), values.get(5), values.get(6), values.get(7), values.get(8), values.get(9)));
+                    statement.executeBatch();
                 }
-                return visitors;
             }
-        } catch (javax.xml.parsers.ParserConfigurationException | SAXException ex) {
-            throw new IOException("The visitor workbook could not be read.", ex);
+        } catch (javax.xml.parsers.ParserConfigurationException | SAXException | SQLException ex) {
+            throw new IOException("The existing visitor workbook could not be migrated.", ex);
         }
     }
 
-    private static void writeVisitors(List<Visitor> visitors) throws IOException {
-        Path temporary = DATA_FILE.resolveSibling(DATA_FILE.getFileName() + ".tmp");
-        try (ZipOutputStream workbook = new ZipOutputStream(Files.newOutputStream(temporary), StandardCharsets.UTF_8)) {
-            writeEntry(workbook, "[Content_Types].xml",
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-                            + "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
-                            + "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
-                            + "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
-                            + "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>"
-                            + "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
-                            + "</Types>");
-            writeEntry(workbook, "_rels/.rels",
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-                            + "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
-                            + "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>"
-                            + "</Relationships>");
-            writeEntry(workbook, "xl/workbook.xml",
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-                            + "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" "
-                            + "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
-                            + "<sheets><sheet name=\"Visitors\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>");
-            writeEntry(workbook, "xl/_rels/workbook.xml.rels",
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-                            + "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">"
-                            + "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>"
-                            + "</Relationships>");
-            StringBuilder sheet = new StringBuilder(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>"
-                            + "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>");
-            appendWorksheetRow(sheet, 1, CSV_HEADER);
-            for (int i = 0; i < visitors.size(); i++) appendWorksheetRow(sheet, i + 2, visitors.get(i).csvFields());
-            sheet.append("</sheetData></worksheet>");
-            writeEntry(workbook, "xl/worksheets/sheet1.xml", sheet.toString());
-        }
-        try {
-            Files.move(temporary, DATA_FILE, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException ex) {
-            Files.move(temporary, DATA_FILE, StandardCopyOption.REPLACE_EXISTING);
+    private static void insertVisitor(Visitor visitor) throws IOException {
+        String sql = """
+                INSERT INTO visitors (
+                    visitor_id, name, contact, purpose, email, residence,
+                    checked_in, checked_out, verified_by, verified_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """;
+        try (Connection connection = openDatabase();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            setVisitor(statement, visitor);
+            statement.executeUpdate();
+        } catch (SQLException ex) {
+            throw new IOException("The visitor record could not be saved to PostgreSQL.", ex);
         }
     }
 
-    private static void writeEntry(ZipOutputStream workbook, String name, String content) throws IOException {
-        workbook.putNextEntry(new ZipEntry(name));
-        workbook.write(content.getBytes(StandardCharsets.UTF_8));
-        workbook.closeEntry();
-    }
-
-    private static void appendWorksheetRow(StringBuilder sheet, int rowNumber, List<String> values) {
-        sheet.append("<row r=\"").append(rowNumber).append("\">");
-        for (int i = 0; i < values.size(); i++) {
-            sheet.append("<c r=\"").append((char) ('A' + i)).append(rowNumber).append("\" t=\"inlineStr\"><is><t xml:space=\"preserve\">")
-                    .append(xmlEscape(values.get(i))).append("</t></is></c>");
+    private static void updateCheckOut(Visitor visitor) throws IOException {
+        try (Connection connection = openDatabase();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE visitors SET checked_out = ? WHERE LOWER(visitor_id) = LOWER(?)")) {
+            statement.setString(1, visitor.checkedOut());
+            statement.setString(2, visitor.id());
+            statement.executeUpdate();
+        } catch (SQLException ex) {
+            throw new IOException("The check-out time could not be saved to PostgreSQL.", ex);
         }
-        sheet.append("</row>");
     }
 
-    private static String xmlEscape(String value) {
-        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                .replace("\"", "&quot;").replace("'", "&apos;");
+    private static void updateVerification(Visitor visitor) throws IOException {
+        try (Connection connection = openDatabase();
+             PreparedStatement statement = connection.prepareStatement(
+                     "UPDATE visitors SET verified_by = ?, verified_at = ? WHERE LOWER(visitor_id) = LOWER(?)")) {
+            statement.setString(1, visitor.verifiedBy());
+            statement.setString(2, visitor.verifiedAt());
+            statement.setString(3, visitor.id());
+            statement.executeUpdate();
+        } catch (SQLException ex) {
+            throw new IOException("The ID verification could not be saved to PostgreSQL.", ex);
+        }
+    }
+
+    private static void setVisitor(PreparedStatement statement, Visitor visitor) throws SQLException {
+        statement.setString(1, visitor.id());
+        statement.setString(2, visitor.name());
+        statement.setString(3, visitor.contact());
+        statement.setString(4, visitor.purpose());
+        statement.setString(5, visitor.email());
+        statement.setString(6, visitor.residence());
+        statement.setString(7, visitor.checkedIn());
+        statement.setString(8, visitor.checkedOut());
+        statement.setString(9, visitor.verifiedBy());
+        statement.setString(10, visitor.verifiedAt());
     }
 
     private static String csvContents(List<Visitor> visitors) {

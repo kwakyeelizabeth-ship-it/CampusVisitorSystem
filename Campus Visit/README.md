@@ -1,6 +1,24 @@
 # Palm University College Visitor System
 
-A Java 17 visitor check-in application with an HTML/CSS/JavaScript interface. Visitor records are stored in `data\visitors.xlsx` as a native Excel workbook. The admin portal can search records and export the complete ledger as an Excel-compatible CSV file.
+A Java 17 visitor check-in application with an HTML/CSS/JavaScript interface. Visitor records are stored in PostgreSQL. When PostgreSQL is initialized, existing records in `data\visitors.xlsx` are migrated automatically. The admin portal can search records and export the complete ledger as an Excel-compatible CSV file.
+
+## PostgreSQL setup
+
+The included Docker Compose configuration starts PostgreSQL and the application:
+
+```bat
+docker compose up --build
+```
+
+The database is available on port `5432`. Data is persisted in the `visitor_postgres_data` Docker volume.
+
+For a local Java run, start PostgreSQL and configure these environment variables (or add them to `admin.properties`):
+
+```properties
+DB_URL=jdbc:postgresql://localhost:5432/visitor_system
+DB_USER=visitor
+DB_PASSWORD=change-this-password
+```
 
 ## Run on Windows
 
